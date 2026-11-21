@@ -19,6 +19,10 @@ pub fn parse(input: &str) -> Option<String> {
     let family = value.get(..open)?;
     let body = value.get(open + 1..)?.strip_suffix(')')?;
 
+    if matches!(family, "oklch" | "oklab") && !body.contains(['(', ')']) {
+        return oklab(family, js::trim(body));
+    }
+
     if !matches!(family, "rgb" | "rgba" | "hsl" | "hsla" | "hwb") || body.contains(['(', ')']) {
         return None;
     }
@@ -121,6 +125,83 @@ pub fn parse(input: &str) -> Option<String> {
 
         rgb
     };
+    Some(encode(rgb, opacity))
+}
+
+/// Converts `oklch()` and `oklab()` to sRGB, clamping channels outside the sRGB gamut.
+fn oklab(family: &str, body: &str) -> Option<String> {
+    let parts: Vec<&str> = body.split('/').map(js::trim).collect();
+
+    if parts.len() > 2 {
+        return None;
+    }
+
+    let channels = split_whitespace(parts.first().copied().unwrap_or_default());
+    let [first, second, third] = channels.as_slice() else {
+        return None;
+    };
+    let opacity = match parts.get(1) {
+        None => 1.0,
+        Some(alpha) => {
+            let value = number(alpha, true)?;
+
+            clamp(value / if alpha.ends_with('%') { 100.0 } else { 1.0 })
+        }
+    };
+    let scaled = |part: &str, full: f64| {
+        number(part, true).map(|value| {
+            if part.ends_with('%') {
+                value / 100.0 * full
+            } else {
+                value
+            }
+        })
+    };
+    let lightness = clamp(scaled(first, 1.0)?);
+    let (a, b) = if family == "oklch" {
+        let chroma = max(0.0, scaled(second, 0.4)?);
+        let (amount, unit) = angle(third)?;
+        let degrees = amount
+            * match unit {
+                "turn" => 360.0,
+                "grad" => 0.9,
+                "rad" => 180.0 / std::f64::consts::PI,
+                _ => 1.0,
+            };
+
+        if !degrees.is_finite() {
+            return None;
+        }
+
+        let radians = degrees.to_radians();
+
+        (chroma * radians.cos(), chroma * radians.sin())
+    } else {
+        (scaled(second, 0.4)?, scaled(third, 0.4)?)
+    };
+    let l = (lightness + 0.396_337_777_4 * a + 0.215_803_757_3 * b).powi(3);
+    let m = (lightness - 0.105_561_345_8 * a - 0.063_854_172_8 * b).powi(3);
+    let s = (lightness - 0.089_484_177_5 * a - 1.291_485_548 * b).powi(3);
+    let linear = [
+        4.076_741_662_1 * l - 3.307_711_591_3 * m + 0.230_969_929_2 * s,
+        -1.268_438_004_6 * l + 2.609_757_401_1 * m - 0.341_319_396_5 * s,
+        -0.004_196_086_3 * l - 0.703_418_614_7 * m + 1.707_614_701 * s,
+    ];
+    let rgb = linear.map(|channel| {
+        let channel = clamp(channel);
+
+        if channel <= 0.003_130_8 {
+            12.92 * channel
+        } else {
+            1.055 * channel.powf(1.0 / 2.4) - 0.055
+        }
+    });
+
+    Some(encode(rgb, opacity))
+}
+
+/// Writes byte-accurate `#rrggbbaa`.
+fn encode(rgb: [f64; 3], opacity: f64) -> String {
     let mut output = String::with_capacity(9);
 
     output.push('#');
@@ -136,7 +217,7 @@ pub fn parse(input: &str) -> Option<String> {
         output.push_str(&digits);
     }
 
-    Some(output)
+    output
 }
 
 /// Matches `^#(?:[\da-f]{3}|[\da-f]{4}|[\da-f]{6}|[\da-f]{8})$`.

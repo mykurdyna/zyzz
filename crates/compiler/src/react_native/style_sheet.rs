@@ -53,6 +53,10 @@ pub enum Platform {
     Android,
     /// `ios`
     Ios,
+    /// `zgx`: a desktop host that draws the native subset of a web style. It keeps `:hover`,
+    /// `:active`, `:focus` and `:disabled` blocks as nested state styles, and drops what it
+    /// cannot draw instead of failing, so one style serves the web and the host.
+    Zgx,
 }
 
 impl Platform {
@@ -61,6 +65,7 @@ impl Platform {
         match self {
             Self::Android => "android",
             Self::Ios => "ios",
+            Self::Zgx => "zgx",
         }
     }
 }
@@ -234,6 +239,7 @@ struct Settings {
 /// set, scheme, style, and declaration order.
 pub fn compile(definition: &style::Definition, options: &Options) -> Result<Tables> {
     let settings = validate(options)?;
+    let lenient = settings.platform == Some(Platform::Zgx);
     let styles = &definition.styles;
     let mut names: FxHashSet<&str> = FxHashSet::default();
     let mut scalar = true;
@@ -247,7 +253,7 @@ pub fn compile(definition: &style::Definition, options: &Options) -> Result<Tabl
             ));
         }
 
-        for part in sequence(style)? {
+        for part in sequence(style, lenient)? {
             let platform_branch = part
                 .targets
                 .as_ref()
@@ -269,6 +275,10 @@ pub fn compile(definition: &style::Definition, options: &Options) -> Result<Tabl
                 }
 
                 let path = [Arc::clone(&style.name), Arc::clone(&declaration.property)];
+
+                if lenient {
+                    continue;
+                }
 
                 if scalar::property(&declaration.property).is_none() {
                     return Err(fail(
@@ -402,6 +412,7 @@ fn validate(options: &Options) -> Result<Settings> {
         Data::Undefined => None,
         Data::String(platform) if &**platform == "android" => Some(Platform::Android),
         Data::String(platform) if &**platform == "ios" => Some(Platform::Ios),
+        Data::String(platform) if &**platform == "zgx" => Some(Platform::Zgx),
         _ => {
             return Err(fail(
                 Code::InvalidOptions,
@@ -487,12 +498,17 @@ fn diagnostic(code: Code, message: impl Into<String>, path: &[Arc<str>]) -> Diag
     }
 }
 
-/// Flattens nested unconditional rules after their parent, rejecting conditions.
-fn sequence(style: &Arc<NamedStyle>) -> Result<Vec<&Arc<NamedStyle>>> {
+/// Flattens nested unconditional rules after their parent, rejecting conditions. A lenient
+/// target skips conditional rules instead: [`states`] reads the ones it can draw.
+fn sequence(style: &Arc<NamedStyle>, lenient: bool) -> Result<Vec<&Arc<NamedStyle>>> {
     let mut parts = vec![style];
 
     for rule in style.rules.iter().flatten() {
         if rule.condition.is_some() {
+            if lenient {
+                continue;
+            }
+
             return Err(fail(
                 Code::UnsupportedFeature,
                 "Selectors, queries, and nested rules are not supported on native.",
@@ -500,10 +516,42 @@ fn sequence(style: &Arc<NamedStyle>) -> Result<Vec<&Arc<NamedStyle>>> {
             ));
         }
 
-        parts.extend(sequence(&rule.style)?);
+        parts.extend(sequence(&rule.style, lenient)?);
     }
 
     Ok(parts)
+}
+
+/// The interaction state a condition selects on its own element, if it is one a host can track.
+fn state(condition: &str) -> Option<&'static str> {
+    let selector = condition.strip_prefix('&').unwrap_or(condition).trim();
+    let selector = selector.strip_suffix(":not(:disabled)").unwrap_or(selector);
+
+    match selector {
+        ":hover" => Some("hover"),
+        ":active" => Some("active"),
+        ":focus" | ":focus-visible" => Some("focus"),
+        ":disabled" => Some("disabled"),
+        _ => None,
+    }
+}
+
+/// A style's state blocks, in authored order, including those inside unconditional rules.
+fn states(style: &Arc<NamedStyle>) -> Vec<(&'static str, &Arc<NamedStyle>)> {
+    let mut found = Vec::new();
+
+    for rule in style.rules.iter().flatten() {
+        match rule.condition.as_deref() {
+            None => found.extend(states(&rule.style)),
+            Some(condition) => {
+                if let Some(name) = state(condition) {
+                    found.push((name, &rule.style));
+                }
+            }
+        }
+    }
+
+    found
 }
 
 struct Compiler<'a> {
@@ -523,79 +571,30 @@ impl Compiler<'_> {
     ) -> Table {
         let mut table = Table::new();
 
+        let lenient = self.settings.platform == Some(Platform::Zgx);
+
         for style in styles {
-            let mut output = NativeStyle::new();
-            let mut line_height: Option<Value> = None;
             let base = [
                 Arc::clone(label),
                 Arc::from(scheme.as_str()),
                 Arc::clone(&style.name),
             ];
-
             // Validation already rejected conditions, so sequencing cannot fail here.
-            for part in sequence(style).unwrap_or_default() {
-                for declaration in &part.declarations {
+            let parts = sequence(style, lenient).unwrap_or_default();
+            let mut output = self.output(&parts, &base, scheme, metadata, resolution);
+
+            if lenient {
+                for (name, block) in states(style) {
+                    let parts = sequence(block, true).unwrap_or_default();
                     let mut path = base.to_vec();
 
-                    path.push(Arc::clone(&declaration.property));
+                    path.push(name.into());
 
-                    let context = Context {
-                        metadata,
-                        path: &path,
-                        scheme,
-                        settings: self.settings,
-                    };
+                    let state = self.output(&parts, &path, scheme, metadata, resolution);
 
-                    if let Err(diagnostic) =
-                        context.declaration(declaration, resolution, &mut output, &mut line_height)
-                    {
-                        self.diagnostics.push(diagnostic);
+                    if !state.is_empty() {
+                        output.insert(name, Data::Object(Arc::new(state)));
                     }
-                }
-
-                let branches = [Some("native"), self.settings.platform.map(Platform::as_str)];
-
-                for branch in branches.into_iter().flatten() {
-                    let input = part.targets.as_ref().and_then(|targets| match branch {
-                        "native" => targets.native.as_ref(),
-                        "ios" => targets.ios.as_ref(),
-                        _ => targets.android.as_ref(),
-                    });
-                    let Some(input) = input else {
-                        continue;
-                    };
-
-                    match values::parse(input) {
-                        Ok(native) => {
-                            for (key, value) in native.iter() {
-                                output.insert(Arc::clone(key), value.clone());
-                            }
-
-                            if native.get("lineHeight").is_some() {
-                                line_height = None;
-                            }
-                        }
-                        Err(error) => {
-                            let mut path = base.to_vec();
-
-                            path.extend(["targets".into(), branch.into()]);
-                            self.diagnostics.push(diagnostic(
-                                Code::UnsupportedValue,
-                                error.text(),
-                                &path,
-                            ));
-                        }
-                    }
-                }
-            }
-
-            if let Some(value) = line_height {
-                let mut path = base.to_vec();
-
-                path.push("lineHeight".into());
-
-                if let Err(diagnostic) = self.line_height(&value, &mut output, &path) {
-                    self.diagnostics.push(diagnostic);
                 }
             }
 
@@ -605,6 +604,97 @@ impl Compiler<'_> {
         }
 
         table
+    }
+
+    /// Converts the declarations of `parts` in order. A lenient target drops what it cannot draw.
+    fn output(
+        &mut self,
+        parts: &[&Arc<NamedStyle>],
+        base: &[Arc<str>],
+        scheme: ColorScheme,
+        metadata: Option<&Metadata>,
+        resolution: &mut Resolution,
+    ) -> NativeStyle {
+        let lenient = self.settings.platform == Some(Platform::Zgx);
+        let mut output = NativeStyle::new();
+        let mut line_height: Option<Value> = None;
+
+        for part in parts {
+            for declaration in &part.declarations {
+                if lenient && scalar::property(&declaration.property).is_none() {
+                    continue;
+                }
+
+                let mut path = base.to_vec();
+
+                path.push(Arc::clone(&declaration.property));
+
+                let context = Context {
+                    metadata,
+                    path: &path,
+                    scheme,
+                    settings: self.settings,
+                };
+
+                if let Err(diagnostic) =
+                    context.declaration(declaration, resolution, &mut output, &mut line_height)
+                {
+                    if !lenient {
+                        self.diagnostics.push(diagnostic);
+                    }
+                }
+            }
+
+            let branches = [Some("native"), self.settings.platform.map(Platform::as_str)];
+
+            for branch in branches.into_iter().flatten() {
+                let input = part.targets.as_ref().and_then(|targets| match branch {
+                    "native" => targets.native.as_ref(),
+                    "ios" => targets.ios.as_ref(),
+                    "android" => targets.android.as_ref(),
+                    _ => None,
+                });
+                let Some(input) = input else {
+                    continue;
+                };
+
+                match values::parse(input) {
+                    Ok(native) => {
+                        for (key, value) in native.iter() {
+                            output.insert(Arc::clone(key), value.clone());
+                        }
+
+                        if native.get("lineHeight").is_some() {
+                            line_height = None;
+                        }
+                    }
+                    Err(error) => {
+                        let mut path = base.to_vec();
+
+                        path.extend(["targets".into(), branch.into()]);
+                        self.diagnostics.push(diagnostic(
+                            Code::UnsupportedValue,
+                            error.text(),
+                            &path,
+                        ));
+                    }
+                }
+            }
+        }
+
+        if let Some(value) = line_height {
+            let mut path = base.to_vec();
+
+            path.push("lineHeight".into());
+
+            if let Err(diagnostic) = self.line_height(&value, &mut output, &path)
+                && !lenient
+            {
+                self.diagnostics.push(diagnostic);
+            }
+        }
+
+        output
     }
 
     fn line_height(
