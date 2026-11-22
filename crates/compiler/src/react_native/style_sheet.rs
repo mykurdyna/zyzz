@@ -634,6 +634,21 @@ impl Compiler<'_> {
                     continue;
                 }
 
+                if lenient
+                    && &*declaration.property == "fontFamily"
+                    && let style::Value::String(families) = &declaration.value
+                {
+                    let families = families.trim_end_matches("!custom").trim();
+                    let family = self.settings.scalar.font(families).map_or_else(
+                        || Arc::from(families),
+                        Arc::clone,
+                    );
+
+                    output.insert(Arc::clone(&declaration.property), Data::String(family));
+
+                    continue;
+                }
+
                 if lenient && scalar::property(&declaration.property).is_none() {
                     continue;
                 }
@@ -1566,11 +1581,13 @@ impl Shadow {
     }
 }
 
-/// `[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?`, case-insensitively, for matrix and scale numbers.
 /// CSS text properties zgx draws that React Native has no property for. A lenient zgx
-/// target passes their keywords through for the host to map.
+/// target passes their keywords through for the host to map. A `fontFamily` passes through
+/// too: the family its `fonts` option maps it to, else the CSS list itself, for the host to
+/// choose from.
 const ZGX_KEYWORDS: [&str; 2] = ["textOverflow", "whiteSpace"];
 
+/// `[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?`, case-insensitively, for matrix and scale numbers.
 const MATRIX: Decimal = Decimal {
     exponent: Exponent::Any,
     fraction: Fraction::Optional,
