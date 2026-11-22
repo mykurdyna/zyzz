@@ -621,6 +621,19 @@ impl Compiler<'_> {
 
         for part in parts {
             for declaration in &part.declarations {
+                if lenient && ZGX_KEYWORDS.contains(&&*declaration.property) {
+                    if let style::Value::String(keyword) = &declaration.value {
+                        let keyword = keyword.trim_end_matches("!custom").trim();
+
+                        output.insert(
+                            Arc::clone(&declaration.property),
+                            Data::String(Arc::from(keyword)),
+                        );
+                    }
+
+                    continue;
+                }
+
                 if lenient && scalar::property(&declaration.property).is_none() {
                     continue;
                 }
@@ -1554,6 +1567,10 @@ impl Shadow {
 }
 
 /// `[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?`, case-insensitively, for matrix and scale numbers.
+/// CSS text properties zgx draws that React Native has no property for. A lenient zgx
+/// target passes their keywords through for the host to map.
+const ZGX_KEYWORDS: [&str; 2] = ["textOverflow", "whiteSpace"];
+
 const MATRIX: Decimal = Decimal {
     exponent: Exponent::Any,
     fraction: Fraction::Optional,
