@@ -639,10 +639,11 @@ impl Compiler<'_> {
                     && let style::Value::String(families) = &declaration.value
                 {
                     let families = families.trim_end_matches("!custom").trim();
-                    let family = self.settings.scalar.font(families).map_or_else(
-                        || Arc::from(families),
-                        Arc::clone,
-                    );
+                    let family = self
+                        .settings
+                        .scalar
+                        .font(families)
+                        .map_or_else(|| Arc::from(families), Arc::clone);
 
                     output.insert(Arc::clone(&declaration.property), Data::String(family));
 
